@@ -7,6 +7,10 @@ using System.Text.Json;
 
 namespace Ship.DeploymentService;
 
+/// <summary>
+/// Background service responsible for managing Docker container deployments on remote ships.
+/// Handles heartbeat communication with headquarters, pulls new container images, and manages container lifecycle.
+/// </summary>
 public class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
@@ -16,9 +20,16 @@ public class Worker : BackgroundService
     private readonly string _shipId;
     private readonly string _hqApiUrl;
     private readonly string _currentVersion;
+    private readonly string _containerName;
     private readonly ResiliencePipeline _pullImagePipeline;
     private readonly ResiliencePipeline _httpPipeline;
 
+    /// <summary>
+    /// Initializes a new instance of the Worker service with required dependencies and configuration.
+    /// </summary>
+    /// <param name="logger">Logger instance for writing log messages</param>
+    /// <param name="httpClientFactory">Factory for creating HTTP clients</param>
+    /// <param name="configuration">Application configuration provider</param>
     public Worker(ILogger<Worker> logger, IHttpClientFactory httpClientFactory, IConfiguration configuration)
     {
         _logger = logger;
@@ -26,6 +37,7 @@ public class Worker : BackgroundService
         _configuration = configuration;
         _shipId = _configuration["ShipId"] ?? Environment.MachineName;
         _hqApiUrl = _configuration["HqApiUrl"] ?? "https://localhost:7001";
+        _containerName = _configuration["ContainerName"] ?? "employeemanagement";
 
         // Initialize Docker client
         _dockerClient = new DockerClientConfiguration(new Uri("npipe://./pipe/docker_engine")).CreateClient();
@@ -38,6 +50,12 @@ public class Worker : BackgroundService
         _currentVersion = GetCurrentVersionAsync().Result ?? "unknown";
     }
 
+    /// <summary>
+    /// Main execution loop of the background service. Continuously checks for internet connectivity,
+    /// sends heartbeats to headquarters, and processes any pending deployments.
+    /// </summary>
+    /// <param name="stoppingToken">Cancellation token to signal when the service should stop</param>
+    /// <returns>A task representing the asynchronous operation</returns>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("Ship Deployment Service started for Ship: {ShipId}", _shipId);
@@ -73,6 +91,10 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Checks if the service has internet connectivity by attempting to reach the headquarters API.
+    /// </summary>
+    /// <returns>True if internet connection is available, false otherwise</returns>
     private async Task<bool> HasInternetConnection()
     {
         try
@@ -87,7 +109,13 @@ public class Worker : BackgroundService
             return false;
         }
     }
-
+        
+    /// <summary>
+    /// Sends a heartbeat to headquarters with current ship status and processes any pending deployments
+    /// returned in the response. Uses resilience pipeline for retry logic.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation</returns>
+    /// <exception cref="HttpRequestException">Thrown when the heartbeat request fails after all retries</exception>
     private async Task SendHeartbeatAndCheckForUpdates()
     {
         await _httpPipeline.ExecuteAsync(async (cancellationToken) =>
@@ -132,6 +160,12 @@ public class Worker : BackgroundService
         });
     }
 
+    /// <summary>
+    /// Processes a single deployment by pulling the image, stopping the current container,
+    /// starting a new container, and updating the deployment status.
+    /// </summary>
+    /// <param name="deployment">The deployment information containing image details and settings</param>
+    /// <returns>A task representing the asynchronous operation</returns>
     private async Task ProcessDeployment(Deployment deployment)
     {
         _logger.LogInformation("Processing deployment {DeploymentId} - {ImagePath}", deployment.Id, deployment.FullImagePath);
@@ -142,10 +176,10 @@ public class Worker : BackgroundService
             await PullImage(deployment.FullImagePath);
 
             // Update deployment status to Downloaded
-            await UpdateDeploymentStatus(deployment.Id, "Downloaded");
+            await UpdateDeploymentStatus(deployment.Id, DeploymentStatus.Downloaded);
 
             // Stop current container
-            await StopContainer("employeemanagement");
+            await StopContainer(_containerName);
 
             // Start new container with settings
             await StartContainerAsync(deployment);
@@ -153,14 +187,14 @@ public class Worker : BackgroundService
             // Verify deployment
             await Task.Delay(10000); // Wait 10 seconds for container to start
 
-            if (await IsContainerRunning("employeemanagement"))
+            if (await IsContainerRunning(_containerName))
             {
-                await UpdateDeploymentStatus(deployment.Id, "Deployed");
+                await UpdateDeploymentStatus(deployment.Id, DeploymentStatus.Deployed);
                 _logger.LogInformation("Deployment {DeploymentId} completed successfully", deployment.Id);
             }
             else
             {
-                await UpdateDeploymentStatus(deployment.Id, "Failed", "Container failed to start");
+                await UpdateDeploymentStatus(deployment.Id, DeploymentStatus.Failed, "Container failed to start");
                 _logger.LogError("Deployment {DeploymentId} failed - container not running", deployment.Id);
             }
         }
@@ -169,7 +203,7 @@ public class Worker : BackgroundService
             _logger.LogError(ex, "Deployment {DeploymentId} failed", deployment.Id);
             try
             {
-                await UpdateDeploymentStatus(deployment.Id, "Failed", ex.Message);
+                await UpdateDeploymentStatus(deployment.Id, DeploymentStatus.Failed, ex.Message);
             }
             catch (Exception statusEx)
             {
@@ -178,6 +212,11 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Creates a resilience pipeline for Docker image pull operations with retry logic,
+    /// timeout handling, and exponential backoff.
+    /// </summary>
+    /// <returns>A configured resilience pipeline for image pull operations</returns>
     private ResiliencePipeline CreatePullImagePipeline()
     {
         // Get retry configuration from settings with defaults
@@ -212,6 +251,11 @@ public class Worker : BackgroundService
             .Build();
     }
 
+    /// <summary>
+    /// Creates a resilience pipeline for HTTP operations with retry logic,
+    /// timeout handling, and exponential backoff for communication with headquarters.
+    /// </summary>
+    /// <returns>A configured resilience pipeline for HTTP operations</returns>
     private ResiliencePipeline CreateHttpPipeline()
     {
         // Get HTTP retry configuration from settings with defaults
@@ -247,6 +291,13 @@ public class Worker : BackgroundService
             .Build();
     }
 
+    /// <summary>
+    /// Pulls a Docker image from the configured registry using authentication credentials.
+    /// Uses the resilience pipeline for retry logic on network failures.
+    /// </summary>
+    /// <param name="imagePath">The full path to the Docker image to pull</param>
+    /// <returns>A task representing the asynchronous operation</returns>
+    /// <exception cref="Exception">Thrown when image pull fails after all retries</exception>
     private async Task PullImage(string imagePath)
     {
         _logger.LogInformation("Pulling image: {ImagePath}", imagePath);
@@ -271,6 +322,12 @@ public class Worker : BackgroundService
         });
     }
 
+    /// <summary>
+    /// Stops and removes a Docker container by name. Gracefully stops the container
+    /// before forcefully removing it.
+    /// </summary>
+    /// <param name="containerName">The name of the container to stop</param>
+    /// <returns>A task representing the asynchronous operation</returns>
     private async Task StopContainer(string containerName)
     {
         try
@@ -309,6 +366,13 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Creates and starts a new Docker container with the specified deployment configuration.
+    /// Configures environment variables, port bindings, resource limits, and health checks.
+    /// </summary>
+    /// <param name="deployment">The deployment configuration containing image and settings</param>
+    /// <returns>The ID of the created container</returns>
+    /// <exception cref="Exception">Thrown when container creation or startup fails</exception>
     public async Task<string> StartContainerAsync(Deployment deployment)
     {
         _logger.LogInformation("Starting container with image: {ImagePath}", deployment.FullImagePath);
@@ -334,7 +398,7 @@ public class Worker : BackgroundService
             var createParams = new CreateContainerParameters
             {
                 Image = deployment.FullImagePath,
-                Name = "employeemanagement",
+                Name = _containerName,
                 Env = allEnvVars,
                 ExposedPorts = new Dictionary<string, EmptyStruct>
             {
@@ -404,6 +468,11 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Checks if a Docker container with the specified name is currently running.
+    /// </summary>
+    /// <param name="containerName">The name of the container to check</param>
+    /// <returns>True if the container exists and is running, false otherwise</returns>
     private async Task<bool> IsContainerRunning(string containerName)
     {
         try
@@ -424,6 +493,11 @@ public class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Retrieves the current version of the running container by examining container labels
+    /// or falling back to extracting version from the image name.
+    /// </summary>
+    /// <returns>The current version string, or null if unable to determine</returns>
     private async Task<string?> GetCurrentVersionAsync()
     {
         try
@@ -433,7 +507,7 @@ public class Worker : BackgroundService
                 All = true,
                 Filters = new Dictionary<string, IDictionary<string, bool>>
                 {
-                    ["name"] = new Dictionary<string, bool> { ["employeemanagement"] = true }
+                    ["name"] = new Dictionary<string, bool> { [_containerName] = true }
                 }
             });
 
@@ -452,7 +526,15 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task UpdateDeploymentStatus(string deploymentId, string status, string? errorMessage = null)
+    /// <summary>
+    /// Updates the deployment status at headquarters using the HTTP resilience pipeline.
+    /// </summary>
+    /// <param name="deploymentId">The unique identifier of the deployment</param>
+    /// <param name="status">The deployment status to set</param>
+    /// <param name="errorMessage">Optional error message if the deployment failed</param>
+    /// <returns>A task representing the asynchronous operation</returns>
+    /// <exception cref="HttpRequestException">Thrown when the status update request fails after all retries</exception>
+    private async Task UpdateDeploymentStatus(string deploymentId, DeploymentStatus status, string? errorMessage = null)
     {
         await _httpPipeline.ExecuteAsync(async (cancellationToken) =>
         {
@@ -462,7 +544,7 @@ public class Worker : BackgroundService
 
             var statusUpdate = new
             {
-                Status = Enum.Parse<DeploymentStatus>(status),
+                Status = status,
                 ErrorMessage = errorMessage
             };
 
